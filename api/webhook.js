@@ -36,22 +36,28 @@ function formatLabel(label) {
     .trim();
 }
 
+const FOOTER =
+  '\n\n━━━━━━━━━━━━━━━━━━\n' +
+  '👤 *Owner:* @heyrajprajapati\n' +
+  '📈 *Buy Followers, Likes, Views:* therajsmm.com';
+
 function formatVehicleData(vehicleNumber, data) {
-  let text = `✅ *Vehicle Data Found: ${vehicleNumber}*\n\n`;
+  let header = `🚘 *VEHICLE INFO*\n*Number:* \`${vehicleNumber}\`\n━━━━━━━━━━━━━━━━━━\n`;
+  let body = '';
 
   if (typeof data === 'object' && data !== null) {
     Object.entries(data).forEach(([key, value]) => {
       if (value !== null && value !== undefined && value !== '') {
-        text += `*${formatLabel(key)}:* ${value}\n`;
+        body += `▪️ *${formatLabel(key)}:* ${value}\n`;
       }
     });
   }
 
-  if (text === `✅ *Vehicle Data Found: ${vehicleNumber}*\n\n`) {
-    text += 'No details available for this vehicle.';
+  if (!body) {
+    body = 'No details available for this vehicle.\n';
   }
 
-  return text;
+  return header + body + FOOTER;
 }
 
 // ==== /start command ====
@@ -60,7 +66,7 @@ async function handleStart(chatId) {
 
   await bot.sendMessage(
     chatId,
-    '👋 *Welcome to Vehicle Info Tracker!*\n\nRegistered vehicle details nikalne ke liye niche button dabao.',
+    '👋 *Welcome to Vehicle Info Tracker!*\n\nRegistered vehicle details nikalne ke liye niche button dabao.' + FOOTER,
     {
       parse_mode: 'Markdown',
       reply_markup: {
@@ -127,8 +133,8 @@ async function handleMessage(msg) {
 
     if (data.success === false || !vehicleData) {
       await bot.editMessageText(
-        '⚠️ Vehicle not found in database. Please check the registration number and try again.',
-        { chat_id: chatId, message_id: loadingMsg.message_id }
+        '⚠️ Vehicle not found in database. Please check the registration number and try again.' + FOOTER,
+        { chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown' }
       );
     } else {
       const formatted = formatVehicleData(vehicleNumber, vehicleData);
