@@ -2,142 +2,32 @@
  * 🔍 Vehicle Info Tracker - Telegram Bot (Webhook version for Vercel)
  * By Ahir Ankush
  *
- * Features:
- *  - /start, vehicle lookup flow
- *  - /stats  (admin only) - usage dashboard
- *  - /broadcast <msg> (admin only) - send a message to every user who has used the bot
- *  - /language - toggle Hindi / English
- *  - "Buy Followers/Likes/Views" inline button linking to therajsmm.com
- *  - /whoami - debug command showing your Telegram ID + configured ADMIN_CHAT_ID
- *
- * Data (users list, stats counters, language prefs) is stored in Upstash Redis
- * (free tier) since Vercel serverless functions don't keep memory between requests.
- *
- * IMPORTANT: We do NOT rely on bot.on('message', ...) event listeners. On Vercel,
- * once this function sends an HTTP response, the instance can be frozen/killed
- * even if an event-listener callback is still awaiting something. So we directly
- * handle the incoming update object and `await` every step, only responding to
- * Telegram once ALL work is fully done.
+ * IMPORTANT: We do NOT rely on bot.on('message', ...) event listeners here.
+ * On Vercel, once this function sends an HTTP response, the serverless
+ * instance can be frozen/killed - even if an event-listener callback is
+ * still awaiting something (like an axios call). So instead we directly
+ * handle the incoming update object and `await` every step, only sending
+ * the response to Telegram once ALL work (including the vehicle API call
+ * and message edit) is fully done.
  */
 
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const { Redis } = require('@upstash/redis');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID; // your Telegram numeric user ID (string)
 const API_URL = 'https://vehicle-info-api-acko.vercel.app/info';
-const PROMO_URL = 'https://therajsmm.com';
 
 if (!BOT_TOKEN) {
   console.error('❌ BOT_TOKEN missing! Set it in Vercel Project Settings -> Environment Variables.');
 }
-if (!ADMIN_CHAT_ID) {
-  console.error('⚠️ ADMIN_CHAT_ID not set - /stats and /broadcast will be disabled for everyone.');
-}
 
+// No polling, no webHook:true - we manually feed updates in in module.exports below.
 const bot = new TelegramBot(BOT_TOKEN);
-const redis = Redis.fromEnv(); // reads UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN
 
+// Best-effort state (see README note on statelessness across invocations).
 const awaitingVehicleNumber = new Set();
 
-// ==== Redis keys ====
-const USERS_KEY = 'bot:users';
-const statsDailyKey = (d) => `bot:stats:daily:${d}`;
-const statsMonthlyKey = (m) => `bot:stats:monthly:${m}`;
-const STATS_TOTAL_KEY = 'bot:stats:total';
-const langKey = (chatId) => `bot:lang:${chatId}`;
-
-function todayStr() {
-  return new Date().toISOString().slice(0, 10);
-}
-function monthStr() {
-  return new Date().toISOString().slice(0, 7);
-}
-
-async function trackUser(chatId) {
-  try {
-    await redis.sadd(USERS_KEY, String(chatId));
-  } catch (e) {
-    console.error('trackUser redis error:', e.message);
-  }
-}
-
-async function trackSearch() {
-  try {
-    await Promise.all([
-      redis.incr(STATS_TOTAL_KEY),
-      redis.incr(statsDailyKey(todayStr())),
-      redis.incr(statsMonthlyKey(monthStr())),
-    ]);
-  } catch (e) {
-    console.error('trackSearch redis error:', e.message);
-  }
-}
-
-async function getLang(chatId) {
-  try {
-    const lang = await redis.get(langKey(chatId));
-    return lang === 'en' ? 'en' : 'hi';
-  } catch (e) {
-    return 'hi';
-  }
-}
-
-async function setLang(chatId, lang) {
-  try {
-    await redis.set(langKey(chatId), lang);
-  } catch (e) {
-    console.error('setLang redis error:', e.message);
-  }
-}
-
-function isAdmin(fromId) {
-  return ADMIN_CHAT_ID && String(fromId) === String(ADMIN_CHAT_ID);
-}
-
-// ==== Text dictionary (Hindi / English) ====
-const TEXTS = {
-  hi: {
-    welcome: '👋 *Welcome to Vehicle Info Tracker!*\n\nRegistered vehicle details nikalne ke liye niche button dabao.',
-    vehicleInfoBtn: '🚗 Vehicle Info',
-    askNumber: '📝 Vehicle number bhejo.\n\nExample: `DL01AB1234`',
-    invalidFormat: '⚠️ Invalid vehicle number format! Minimum 8 characters chahiye (e.g. DL01AB1234). Dobara bhejo.',
-    scanning: '🔎 Scanning... please wait.',
-    notFound: '⚠️ Vehicle not found in database. Please check the registration number and try again.',
-    errorPrefix: '❌ *Error fetching vehicle data.*\n\n',
-    errorStatus: (s) => `Status: ${s}\nPlease check the vehicle number and try again.`,
-    errorTimeout: 'Request timed out. Please try again.',
-    askAgain: 'Ek aur vehicle check karna hai? /start dabao.',
-    langPrompt: '🌐 Apni pasand ki bhasha chuno:',
-    langSet: '✅ Bhasha Hindi set kar di gayi.',
-    notAdmin: '⛔ Ye command sirf admin use kar sakta hai.',
-    broadcastUsage: 'Usage: `/broadcast tumhara message yaha`',
-    broadcastDone: (sent, failed, total) => `📢 Broadcast bhej diya.\n\n✅ Sent: ${sent}\n❌ Failed: ${failed}\n👥 Total users: ${total}`,
-  },
-  en: {
-    welcome: '👋 *Welcome to Vehicle Info Tracker!*\n\nTap the button below to look up registered vehicle details.',
-    vehicleInfoBtn: '🚗 Vehicle Info',
-    askNumber: '📝 Send the vehicle number.\n\nExample: `DL01AB1234`',
-    invalidFormat: '⚠️ Invalid vehicle number format! Minimum 8 characters required (e.g. DL01AB1234). Please resend.',
-    scanning: '🔎 Scanning... please wait.',
-    notFound: '⚠️ Vehicle not found in database. Please check the registration number and try again.',
-    errorPrefix: '❌ *Error fetching vehicle data.*\n\n',
-    errorStatus: (s) => `Status: ${s}\nPlease check the vehicle number and try again.`,
-    errorTimeout: 'Request timed out. Please try again.',
-    askAgain: 'Want to check another vehicle? Tap /start.',
-    langPrompt: '🌐 Choose your preferred language:',
-    langSet: '✅ Language set to English.',
-    notAdmin: '⛔ This command is admin-only.',
-    broadcastUsage: 'Usage: `/broadcast your message here`',
-    broadcastDone: (sent, failed, total) => `📢 Broadcast sent.\n\n✅ Sent: ${sent}\n❌ Failed: ${failed}\n👥 Total users: ${total}`,
-  },
-};
-
-const OWNER_FOOTER = '\n\n━━━━━━━━━━━━━━━━━━\n👤 *Owner:* @heyrajprajapati';
-
-const promoButtonRow = [{ text: '📈 Buy Followers/Likes/Views', url: PROMO_URL }];
-
+// ==== Format vehicle data nicely for Telegram ====
 function formatLabel(label) {
   return label
     .replace(/([A-Z])/g, ' $1')
@@ -145,6 +35,11 @@ function formatLabel(label) {
     .replace(/^./, (c) => c.toUpperCase())
     .trim();
 }
+
+const FOOTER =
+  '\n\n━━━━━━━━━━━━━━━━━━\n' +
+  '👤 *Owner:* @heyrajprajapati\n' +
+  '📈 *Buy Followers, Likes, Views:* therajsmm.com';
 
 function formatVehicleData(vehicleNumber, data) {
   let header = `🚘 *VEHICLE INFO*\n*Number:* \`${vehicleNumber}\`\n━━━━━━━━━━━━━━━━━━\n`;
@@ -162,114 +57,25 @@ function formatVehicleData(vehicleNumber, data) {
     body = 'No details available for this vehicle.\n';
   }
 
-  return header + body + OWNER_FOOTER;
+  return header + body + FOOTER;
 }
 
 // ==== /start command ====
 async function handleStart(chatId) {
   awaitingVehicleNumber.delete(chatId);
-  const [, lang] = await Promise.all([trackUser(chatId), getLang(chatId)]);
-  const t = TEXTS[lang];
 
-  await bot.sendMessage(chatId, t.welcome + OWNER_FOOTER, {
-    parse_mode: 'Markdown',
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: t.vehicleInfoBtn, callback_data: 'vehicle_info' }],
-        promoButtonRow,
-      ],
-    },
-  });
-}
-
-// ==== /language command ====
-async function handleLanguageCommand(chatId) {
-  const lang = await getLang(chatId);
-  const t = TEXTS[lang];
-  await bot.sendMessage(chatId, t.langPrompt, {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: '🇮🇳 हिंदी', callback_data: 'lang_hi' },
-          { text: '🇬🇧 English', callback_data: 'lang_en' },
+  await bot.sendMessage(
+    chatId,
+    '👋 *Welcome to Vehicle Info Tracker!*\n\nRegistered vehicle details nikalne ke liye niche button dabao.' + FOOTER,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🚗 Vehicle Info', callback_data: 'vehicle_info' }],
         ],
-      ],
-    },
-  });
-}
-
-// ==== /stats command (admin only) ====
-async function handleStatsCommand(chatId, fromId) {
-  const lang = await getLang(chatId);
-  const t = TEXTS[lang];
-
-  if (!isAdmin(fromId)) {
-    await bot.sendMessage(chatId, t.notAdmin);
-    return;
-  }
-
-  try {
-    const [totalUsers, totalSearches, todaySearches, monthSearches] = await Promise.all([
-      redis.scard(USERS_KEY),
-      redis.get(STATS_TOTAL_KEY),
-      redis.get(statsDailyKey(todayStr())),
-      redis.get(statsMonthlyKey(monthStr())),
-    ]);
-
-    const msg =
-      `📊 *Bot Stats*\n\n` +
-      `👥 Total Users: ${totalUsers || 0}\n` +
-      `🔍 Total Searches: ${totalSearches || 0}\n` +
-      `📅 Today: ${todaySearches || 0}\n` +
-      `🗓️ This Month: ${monthSearches || 0}`;
-
-    await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-  } catch (e) {
-    console.error('stats error:', e.message);
-    await bot.sendMessage(chatId, '❌ Stats fetch failed: ' + e.message);
-  }
-}
-
-// ==== /broadcast command (admin only) ====
-async function handleBroadcastCommand(chatId, fromId, fullText) {
-  const lang = await getLang(chatId);
-  const t = TEXTS[lang];
-
-  if (!isAdmin(fromId)) {
-    await bot.sendMessage(chatId, t.notAdmin);
-    return;
-  }
-
-  const message = fullText.replace(/^\/broadcast/i, '').trim();
-  if (!message) {
-    await bot.sendMessage(chatId, t.broadcastUsage, { parse_mode: 'Markdown' });
-    return;
-  }
-
-  let userIds = [];
-  try {
-    userIds = await redis.smembers(USERS_KEY);
-  } catch (e) {
-    await bot.sendMessage(chatId, '❌ Could not load user list: ' + e.message);
-    return;
-  }
-
-  let sent = 0;
-  let failed = 0;
-
-  for (let i = 0; i < userIds.length; i++) {
-    try {
-      await bot.sendMessage(userIds[i], message);
-      sent++;
-    } catch (e) {
-      failed++;
+      },
     }
-    if (i % 25 === 24) {
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-  }
-
-  await bot.sendMessage(chatId, t.broadcastDone(sent, failed, userIds.length), { parse_mode: 'Markdown' });
+  );
 }
 
 // ==== Button click handler ====
@@ -278,124 +84,86 @@ async function handleCallbackQuery(query) {
 
   if (query.data === 'vehicle_info') {
     awaitingVehicleNumber.add(chatId);
-    const lang = await getLang(chatId);
-    const t = TEXTS[lang];
 
     await bot.answerCallbackQuery(query.id);
-    await bot.sendMessage(chatId, t.askNumber, { parse_mode: 'Markdown' });
-    return;
+    await bot.sendMessage(
+      chatId,
+      '📝 Vehicle number bhejo.\n\nExample: `DL01AB1234`',
+      { parse_mode: 'Markdown' }
+    );
+  } else {
+    // Unknown callback - still ack it so Telegram doesn't show a loading spinner forever.
+    await bot.answerCallbackQuery(query.id).catch(() => {});
   }
-
-  if (query.data === 'lang_hi' || query.data === 'lang_en') {
-    const newLang = query.data === 'lang_hi' ? 'hi' : 'en';
-    await setLang(chatId, newLang);
-    await bot.answerCallbackQuery(query.id);
-    await bot.sendMessage(chatId, TEXTS[newLang].langSet);
-    return;
-  }
-
-  await bot.answerCallbackQuery(query.id).catch(() => {});
 }
 
-// ==== Handle plain text messages ====
+// ==== Handle plain text messages (vehicle number input) ====
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
-  const fromId = msg.from ? msg.from.id : chatId;
   const text = msg.text ? msg.text.trim() : '';
-
-  if (!text) return;
-
-  await trackUser(chatId);
 
   if (text.startsWith('/start')) {
     await handleStart(chatId);
     return;
   }
-  if (text.startsWith('/language')) {
-    await handleLanguageCommand(chatId);
-    return;
-  }
-  if (text.startsWith('/whoami')) {
-    await bot.sendMessage(
-      chatId,
-      `🆔 *Your Telegram ID:* \`${fromId}\`\n` +
-        `🔑 *Configured ADMIN_CHAT_ID:* \`${ADMIN_CHAT_ID || 'NOT SET'}\`\n` +
-        `✅ *Match:* ${isAdmin(fromId) ? 'YES ✅' : 'NO ❌'}`,
-      { parse_mode: 'Markdown' }
-    );
-    return;
-  }
-  if (text.startsWith('/stats')) {
-    await handleStatsCommand(chatId, fromId);
-    return;
-  }
-  if (text.startsWith('/broadcast')) {
-    await handleBroadcastCommand(chatId, fromId, text);
-    return;
-  }
-  if (text.startsWith('/')) return;
 
+  if (!text || text.startsWith('/')) return;
   if (!awaitingVehicleNumber.has(chatId)) return;
-
-  const lang = await getLang(chatId);
-  const t = TEXTS[lang];
 
   const vehicleNumber = text.toUpperCase().replace(/\s+/g, '');
 
   if (vehicleNumber.length < 8) {
-    await bot.sendMessage(chatId, t.invalidFormat);
+    await bot.sendMessage(
+      chatId,
+      '⚠️ Invalid vehicle number format! Minimum 8 characters chahiye (e.g. DL01AB1234). Dobara bhejo.'
+    );
     return;
   }
 
-  const loadingMsg = await bot.sendMessage(chatId, t.scanning);
+  const loadingMsg = await bot.sendMessage(chatId, '🔎 Scanning... please wait.');
 
   try {
-    const [response] = await Promise.all([
-      axios.get(API_URL, { params: { vehicle: vehicleNumber }, timeout: 20000 }),
-      trackSearch(),
-    ]);
+    const response = await axios.get(API_URL, {
+      params: { vehicle: vehicleNumber },
+      timeout: 20000,
+    });
 
     const data = response.data;
     const vehicleData = data.data || data;
 
     if (data.success === false || !vehicleData) {
-      await bot.editMessageText(t.notFound + OWNER_FOOTER, {
-        chat_id: chatId,
-        message_id: loadingMsg.message_id,
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [promoButtonRow] },
-      });
+      await bot.editMessageText(
+        '⚠️ Vehicle not found in database. Please check the registration number and try again.' + FOOTER,
+        { chat_id: chatId, message_id: loadingMsg.message_id, parse_mode: 'Markdown' }
+      );
     } else {
       const formatted = formatVehicleData(vehicleNumber, vehicleData);
       await bot.editMessageText(formatted, {
         chat_id: chatId,
         message_id: loadingMsg.message_id,
         parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [promoButtonRow] },
       });
     }
   } catch (error) {
     console.error('API Error:', error.message);
 
-    let errorText = t.errorPrefix;
+    let errorText = '❌ *Error fetching vehicle data.*\n\n';
     if (error.response) {
-      errorText += t.errorStatus(error.response.status);
+      errorText += `Status: ${error.response.status}\nPlease check the vehicle number and try again.`;
     } else if (error.code === 'ECONNABORTED') {
-      errorText += t.errorTimeout;
+      errorText += 'Request timed out. Please try again.';
     } else {
-      errorText += error.message;
+      errorText += `${error.message}`;
     }
 
-    await bot
-      .editMessageText(errorText, {
-        chat_id: chatId,
-        message_id: loadingMsg.message_id,
-        parse_mode: 'Markdown',
-      })
-      .catch((editErr) => console.error('editMessageText failed:', editErr.message));
+    await bot.editMessageText(errorText, {
+      chat_id: chatId,
+      message_id: loadingMsg.message_id,
+      parse_mode: 'Markdown',
+    }).catch((editErr) => console.error('editMessageText failed:', editErr.message));
   } finally {
     awaitingVehicleNumber.delete(chatId);
-    await bot.sendMessage(chatId, t.askAgain);
+    await bot.sendMessage(chatId, 'Ek aur vehicle check karna hai? /start dabao.');
   }
 }
 
@@ -418,5 +186,7 @@ module.exports = async (req, res) => {
     console.error('Update handling error:', err.message);
   }
 
+  // Respond ONLY after all the above awaited work is fully complete -
+  // this is what stops Vercel from freezing the function mid-work.
   res.status(200).send('OK');
 };
