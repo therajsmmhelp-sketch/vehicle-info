@@ -8,6 +8,7 @@
  *  - /broadcast <msg> (admin only) - send a message to every user who has used the bot
  *  - /language - toggle Hindi / English
  *  - "Buy Followers/Likes/Views" inline button linking to therajsmm.com
+ *  - /whoami - debug command showing your Telegram ID + configured ADMIN_CHAT_ID
  *
  * Data (users list, stats counters, language prefs) is stored in Upstash Redis
  * (free tier) since Vercel serverless functions don't keep memory between requests.
@@ -38,7 +39,6 @@ if (!ADMIN_CHAT_ID) {
 const bot = new TelegramBot(BOT_TOKEN);
 const redis = Redis.fromEnv(); // reads UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN
 
-// Best-effort in-memory state (fine for short-lived warm instances; not durable).
 const awaitingVehicleNumber = new Set();
 
 // ==== Redis keys ====
@@ -49,10 +49,10 @@ const STATS_TOTAL_KEY = 'bot:stats:total';
 const langKey = (chatId) => `bot:lang:${chatId}`;
 
 function todayStr() {
-  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  return new Date().toISOString().slice(0, 10);
 }
 function monthStr() {
-  return new Date().toISOString().slice(0, 7); // YYYY-MM
+  return new Date().toISOString().slice(0, 7);
 }
 
 async function trackUser(chatId) {
@@ -78,7 +78,7 @@ async function trackSearch() {
 async function getLang(chatId) {
   try {
     const lang = await redis.get(langKey(chatId));
-    return lang === 'en' ? 'en' : 'hi'; // default Hindi
+    return lang === 'en' ? 'en' : 'hi';
   } catch (e) {
     return 'hi';
   }
@@ -136,7 +136,6 @@ const TEXTS = {
 
 const OWNER_FOOTER = '\n\n━━━━━━━━━━━━━━━━━━\n👤 *Owner:* @heyrajprajapati';
 
-// Inline "Buy Followers/Likes/Views" button - added to relevant messages.
 const promoButtonRow = [{ text: '📈 Buy Followers/Likes/Views', url: PROMO_URL }];
 
 function formatLabel(label) {
@@ -169,8 +168,7 @@ function formatVehicleData(vehicleNumber, data) {
 // ==== /start command ====
 async function handleStart(chatId) {
   awaitingVehicleNumber.delete(chatId);
-  await trackUser(chatId);
-  const lang = await getLang(chatId);
+  const [, lang] = await Promise.all([trackUser(chatId), getLang(chatId)]);
   const t = TEXTS[lang];
 
   await bot.sendMessage(chatId, t.welcome + OWNER_FOOTER, {
@@ -266,7 +264,6 @@ async function handleBroadcastCommand(chatId, fromId, fullText) {
     } catch (e) {
       failed++;
     }
-    // Small pause every 25 messages to stay safely under Telegram's rate limits.
     if (i % 25 === 24) {
       await new Promise((r) => setTimeout(r, 1000));
     }
@@ -318,6 +315,16 @@ async function handleMessage(msg) {
     await handleLanguageCommand(chatId);
     return;
   }
+  if (text.startsWith('/whoami')) {
+    await bot.sendMessage(
+      chatId,
+      `🆔 *Your Telegram ID:* \`${fromId}\`\n` +
+        `🔑 *Configured ADMIN_CHAT_ID:* \`${ADMIN_CHAT_ID || 'NOT SET'}\`\n` +
+        `✅ *Match:* ${isAdmin(fromId) ? 'YES ✅' : 'NO ❌'}`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
   if (text.startsWith('/stats')) {
     await handleStatsCommand(chatId, fromId);
     return;
@@ -326,7 +333,7 @@ async function handleMessage(msg) {
     await handleBroadcastCommand(chatId, fromId, text);
     return;
   }
-  if (text.startsWith('/')) return; // unknown command, ignore
+  if (text.startsWith('/')) return;
 
   if (!awaitingVehicleNumber.has(chatId)) return;
 
@@ -341,13 +348,12 @@ async function handleMessage(msg) {
   }
 
   const loadingMsg = await bot.sendMessage(chatId, t.scanning);
-  await trackSearch();
 
   try {
-    const response = await axios.get(API_URL, {
-      params: { vehicle: vehicleNumber },
-      timeout: 20000,
-    });
+    const [response] = await Promise.all([
+      axios.get(API_URL, { params: { vehicle: vehicleNumber }, timeout: 20000 }),
+      trackSearch(),
+    ]);
 
     const data = response.data;
     const vehicleData = data.data || data;
